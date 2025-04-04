@@ -79,7 +79,7 @@ def main():
         cond_dicts_generator=generator(),
         chunk_schedule=[15, 9, 9, 9, 9, 9, *range(9, 100)],  # optimal schedule for RTX3090 and this warmup
         chunk_overlap=2,  # tokens to overlap between chunks (affects crossfade)
-        warmup_prefill="And I say OK",
+        warmup_prefill="And I say OK.",
         mark_boundaries=True,
     )
 
