@@ -510,10 +510,11 @@ class Zonos(nn.Module):
                     if previous_audio is not None and generator_index >= 0:
                         # Apply a log fade in to the first chunk to avoid a pop
                         if not first_chunk_yielded:
-                            logfade = torch.logspace(1, 0, 2 * window_size, base=20, device=device)
-                            logfade -= logfade.min()
-                            logfade /= logfade.max()
-                            previous_audio[..., : 2 * window_size] *= logfade.flip(0)
+                            if previous_audio.shape[-1] > 2 * window_size:
+                                logfade = torch.logspace(1, 0, 2 * window_size, base=20, device=device)
+                                logfade -= logfade.min()
+                                logfade /= logfade.max()
+                                previous_audio[..., : 2 * window_size] *= logfade.flip(0) 
                             first_chunk_yielded = True
 
                         yield previous_audio
