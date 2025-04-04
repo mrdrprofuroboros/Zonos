@@ -55,7 +55,7 @@ def main():
     audio_chunks = []
     t0 = time.time()
     generated = 0
-    ttfb = None
+    ttfb = 0 # Time to first byte
 
     def generator():
         # Can stream from your LLM or other source here, just partition the text into
