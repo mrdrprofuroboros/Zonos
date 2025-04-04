@@ -55,7 +55,7 @@ def main():
     audio_chunks = []
     t0 = time.time()
     generated = 0
-    ttfb = None
+    ttfb = 0 # Time to first byte
 
     def generator():
         # Can stream from your LLM or other source here, just partition the text into
@@ -79,7 +79,7 @@ def main():
         cond_dicts_generator=generator(),
         chunk_schedule=[15, 9, 9, 9, 9, 9, *range(9, 100)],  # optimal schedule for RTX3090 and this warmup
         chunk_overlap=2,  # tokens to overlap between chunks (affects crossfade)
-        warmup_prefill="And I say OK",
+        warmup_prefill="And I say OK.",
         mark_boundaries=True,
     )
 

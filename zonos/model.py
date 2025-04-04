@@ -281,7 +281,6 @@ class Zonos(nn.Module):
         max_steps = delayed_codes.shape[2] - offset
         remaining_steps = torch.full((batch_size,), max_steps, device=device)
         progress = tqdm(total=max_steps, desc="Generating", disable=not progress_bar)
-        cfg_scale = torch.tensor(cfg_scale)
 
         step = 0
         while torch.max(remaining_steps) > 0:
@@ -434,7 +433,6 @@ class Zonos(nn.Module):
             stopping = torch.zeros(batch_size, dtype=torch.bool, device=device)
             max_steps = delayed_codes.shape[2] - offset
             remaining_steps = torch.full((batch_size,), max_steps, device=device)
-            cfg_scale = torch.tensor(cfg_scale)
             step = 0
             # This variable will let us yield only the new audio since the last yield.
             prev_valid_length = prefix_audio_len
@@ -510,10 +508,11 @@ class Zonos(nn.Module):
                     if previous_audio is not None and generator_index >= 0:
                         # Apply a log fade in to the first chunk to avoid a pop
                         if not first_chunk_yielded:
-                            logfade = torch.logspace(1, 0, 2 * window_size, base=20, device=device)
-                            logfade -= logfade.min()
-                            logfade /= logfade.max()
-                            previous_audio[..., : 2 * window_size] *= logfade.flip(0)
+                            if previous_audio.shape[-1] > 2 * window_size:
+                                logfade = torch.logspace(1, 0, 2 * window_size, base=20, device=device)
+                                logfade -= logfade.min()
+                                logfade /= logfade.max()
+                                previous_audio[..., : 2 * window_size] *= logfade.flip(0) 
                             first_chunk_yielded = True
 
                         yield previous_audio
