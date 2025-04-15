@@ -268,7 +268,6 @@ class Zonos(nn.Module):
         frame.masked_scatter_(frame == UNKNOWN_TOKEN, next_token)
 
         prefix_length = prefix_conditioning.shape[1] + prefix_audio_len + 1
-        inference_params.seqlen_offset += prefix_length
         inference_params.lengths_per_sample[:] += prefix_length
 
         logit_bias = torch.zeros_like(logits)
@@ -304,7 +303,6 @@ class Zonos(nn.Module):
 
             frame = delayed_codes[..., offset : offset + 1]
             frame.masked_scatter_(frame == UNKNOWN_TOKEN, next_token)
-            inference_params.seqlen_offset += 1
             inference_params.lengths_per_sample[:] += 1
 
             remaining_steps -= 1
@@ -410,7 +408,6 @@ class Zonos(nn.Module):
             frame.masked_scatter_(frame == UNKNOWN_TOKEN, next_token)
 
             prefix_length = prefix_conditioning.shape[1] + prefix_audio_len + 1
-            inference_params.seqlen_offset += prefix_length
             inference_params.lengths_per_sample[:] += prefix_length
 
             logit_bias = torch.zeros_like(logits)
@@ -453,7 +450,6 @@ class Zonos(nn.Module):
 
                 frame = delayed_codes[..., offset : offset + 1]
                 frame.masked_scatter_(frame == UNKNOWN_TOKEN, next_token)
-                inference_params.seqlen_offset += 1
                 inference_params.lengths_per_sample[:] += 1
                 remaining_steps -= 1
                 step += 1

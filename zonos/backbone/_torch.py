@@ -37,16 +37,31 @@ def _update_kv_cache(
     assert layer_idx in inference_params.key_value_memory_dict
     kv_cache, _ = inference_params.key_value_memory_dict[layer_idx]
     # Adjust key and value for inference
-    batch_start = inference_params.batch_size_offset
-    batch_end = batch_start + k.shape[0]
-    sequence_start = inference_params.seqlen_offset
-    sequence_end = sequence_start + k.shape[1]
-    assert batch_end <= kv_cache.shape[0]
-    assert sequence_end <= kv_cache.shape[1]
-    assert kv_cache is not None
-    kv_cache[batch_start:batch_end, sequence_start:sequence_end, 0, ...] = k
-    kv_cache[batch_start:batch_end, sequence_start:sequence_end, 1, ...] = v
-    return kv_cache[batch_start:batch_end, :sequence_end, ...]
+    start = inference_params.lengths_per_sample.long()  # [B]
+    seq_idx = start.unsqueeze(1) + torch.arange(k.shape[1], device=k.device).unsqueeze(0)  # [B, S]
+    kv_cache[:, seq_idx, 0, ...] = k
+    kv_cache[:, seq_idx, 1, ...] = v
+    return kv_cache
+
+
+def _build_attn_mask(lengths_per_sample, tgt_len, src_len, device, num_heads):
+    # 1. Mask out positions before each sample's offset
+    src_positions = torch.arange(src_len, device=device)  # [src_len]
+    offset_mask = src_positions.unsqueeze(0) < lengths_per_sample.unsqueeze(1)  # [B, src_len]
+    offset_mask = offset_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, src_len]
+
+    # 2. Causal mask for each query position
+    causal_mask = torch.triu(torch.ones(tgt_len, src_len, device=device), 1).bool()  # [tgt_len, src_len]
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, tgt_len, src_len]
+
+    # 3. Combine masks (logical OR)
+    attn_mask = offset_mask | causal_mask  # [B, 1, tgt_len, src_len]
+    attn_mask = attn_mask.expand(-1, num_heads, -1, -1)  # [B, num_heads, tgt_len, src_len]
+
+    # 4. Convert to float mask for scaled_dot_product_attention
+    attn_mask = attn_mask.masked_fill(attn_mask, float("-inf"))
+
+    return attn_mask
 
 
 class TorchZonosBackbone(nn.Module):
@@ -133,7 +148,14 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=seqlen > 1, enable_gqa=True)
+        attn_mask = _build_attn_mask(
+            inference_params.lengths_per_sample,
+            tgt_len=seqlen,
+            src_len=kv.shape[1],
+            device=k.device,
+            num_heads=self.num_heads,
+        )
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
 
         y = y.transpose(1, 2).contiguous().view(batch_size, seqlen, q_size)
 
