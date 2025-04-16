@@ -119,7 +119,8 @@ class Zonos(nn.Module):
         last_hidden_states = self.backbone(hidden_states, inference_params)[:, -1, :].unsqueeze(1)
         logits = self.apply_heads(last_hidden_states).squeeze(2).float()
         if cfg_scale != 1.0:
-            cond_logits, uncond_logits = logits.chunk(2)
+            cond_logits = logits[::2]
+            uncond_logits = logits[1::2]
             logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
         logits[..., 1025:].fill_(-torch.inf)  # ensures padding is ignored
         return logits
@@ -148,7 +149,9 @@ class Zonos(nn.Module):
 
         if not allow_cudagraphs or input_ids.device.type != "cuda":
             hidden_states_local = self.embed_codes(input_ids)
-            hidden_states_local = hidden_states_local.repeat(2, 1, 1)
+            # repeat_interleave ensures that cond and uncond are neighboring in batch,
+            # so we can compose batches from separate streams with regular stack / cat
+            hidden_states_local = hidden_states_local.repeat_interleave(2, dim=0)
             return self._compute_logits(hidden_states_local, inference_params, cfg_scale)
 
         need_capture = (self._cg_graph is None) or (self._cg_batch_size != bsz)
@@ -162,7 +165,7 @@ class Zonos(nn.Module):
 
             for _ in range(3):
                 hidden_states = self.embed_codes(input_ids)
-                hidden_states = hidden_states.repeat(2, 1, 1)  # because cfg != 1.0
+                hidden_states = hidden_states.repeat_interleave(2, dim=0)  # because cfg != 1.0
                 logits = self._compute_logits(hidden_states, inference_params, cfg_scale)
 
             self._cg_input_ids = input_ids.clone()
@@ -172,7 +175,7 @@ class Zonos(nn.Module):
 
             def capture_region():
                 hidden_states_local = self.embed_codes(self._cg_input_ids)
-                hidden_states_local = hidden_states_local.repeat(2, 1, 1)
+                hidden_states_local = hidden_states_local.repeat_interleave(2, dim=0)
                 self._cg_logits = self._compute_logits(hidden_states_local, self._cg_inference_params, self._cg_scale)
 
             with torch.cuda.graph(g):
@@ -265,7 +268,10 @@ class Zonos(nn.Module):
 
         offset = delayed_prefix_audio_codes.shape[2]
         frame = delayed_codes[..., offset : offset + 1]
-        frame.masked_scatter_(frame == UNKNOWN_TOKEN, next_token)
+        # For multiple batches, we can't use frame.masked_scatter_(frame == unknown_token, next_token)
+        # because it is continuing one-by-one for each unmasked entry
+        # going across batches
+        delayed_codes[..., offset : offset + 1] = torch.where(frame == UNKNOWN_TOKEN, next_token, frame)
 
         prefix_length = prefix_conditioning.shape[1] + prefix_audio_len + 1
         inference_params.lengths_per_sample[:] += prefix_length
@@ -302,7 +308,7 @@ class Zonos(nn.Module):
                     next_token[i, idx] = self.eos_token_id
 
             frame = delayed_codes[..., offset : offset + 1]
-            frame.masked_scatter_(frame == UNKNOWN_TOKEN, next_token)
+            delayed_codes[..., offset : offset + 1] = torch.where(frame == UNKNOWN_TOKEN, next_token, frame)
             inference_params.lengths_per_sample[:] += 1
 
             remaining_steps -= 1

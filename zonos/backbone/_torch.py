@@ -34,26 +34,33 @@ def _update_kv_cache(
     k: torch.Tensor, v: torch.Tensor, inference_params: InferenceParams, layer_idx: int
 ) -> torch.Tensor:
     """k/v: (batch_size, seqlen, nheads, head_dim) or (batch_size, 1, nheads, head_dim)"""
-    assert layer_idx in inference_params.key_value_memory_dict
     kv_cache, _ = inference_params.key_value_memory_dict[layer_idx]
     # Adjust key and value for inference
     start = inference_params.lengths_per_sample.long()  # [B]
     seq_idx = start.unsqueeze(1) + torch.arange(k.shape[1], device=k.device).unsqueeze(0)  # [B, S]
-    kv_cache[:, seq_idx, 0, ...] = k
-    kv_cache[:, seq_idx, 1, ...] = v
-    return kv_cache[:, : start[0] + k.shape[1], ...]
+    batch_idx = torch.arange(len(start), device=k.device).unsqueeze(1)  # [B, 1]
+    kv_cache[batch_idx, seq_idx, 0, ...] = k
+    kv_cache[batch_idx, seq_idx, 1, ...] = v
+    return kv_cache[:, : start.max() + k.shape[1], ...]
 
 
-def _build_attn_mask(B, H, q, k, is_causal=True):
-    L, S = q.size(-2), k.size(-2)
+def _build_attn_mask(B, H, L, S, is_causal=True, lengths_per_sample=None, device="cuda"):
+    attn_bias = torch.zeros(L, S, dtype=torch.bfloat16, device=device)
+
     if is_causal:
-        attn_bias = torch.zeros(L, S, dtype=q.dtype, device=q.device)
-        temp_mask = torch.ones(L, S, dtype=torch.bool, device=q.device).tril(diagonal=0)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-    else:
-        attn_bias = torch.zeros(L, S, dtype=q.dtype, device=q.device)  # No masking
+        temp_mask = torch.ones(L, S, dtype=torch.bool, device=device).tril(diagonal=0)
+        attn_bias.masked_fill_(~temp_mask, float("-inf"))
 
     attn_bias = attn_bias.unsqueeze(0).unsqueeze(0).expand(B, H, L, S)
+
+    if lengths_per_sample is not None and L == 1:
+        arange = torch.arange(S, device=device)
+        # valid: [B, S], True where unmasked
+        valid = arange <= lengths_per_sample.unsqueeze(1)
+        # mask: [B, H, L, S], True where masked
+        mask = ~valid[:, None, None, :].expand(B, H, L, S)
+        attn_bias = attn_bias.masked_fill(mask, float("-inf"))
+
     return attn_bias
 
 
@@ -83,8 +90,16 @@ class TorchZonosBackbone(nn.Module):
         input_pos = input_pos + inference_params.lengths_per_sample.unsqueeze(-1)
 
         freqs_cis = self.freqs_cis[input_pos].expand(hidden_states.shape[0], -1, -1, -1)
+        attn_mask = _build_attn_mask(
+            hidden_states.shape[0],
+            self.config.attn_cfg["num_heads"],
+            hidden_states.shape[1],
+            inference_params.lengths_per_sample.max() + hidden_states.shape[1],
+            is_causal=hidden_states.shape[1] > 1,
+            lengths_per_sample=inference_params.lengths_per_sample,
+        )
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, inference_params, freqs_cis)
+            hidden_states = layer(hidden_states, inference_params, freqs_cis, attn_mask)
         return self.norm_f(hidden_states)
 
 
@@ -102,10 +117,14 @@ class TransformerBlock(nn.Module):
         self.head_dim = config.d_model // config.attn_cfg["num_heads"]
 
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16):
-        return torch.empty(batch_size, max_seqlen, 2, self.num_heads_kv, self.head_dim, dtype=dtype), None
+        # setting it to zeros rather than empty to avoid nan explosions in scaled_dot_product_attention
+        # in the masked out regions
+        return torch.zeros(batch_size, max_seqlen, 2, self.num_heads_kv, self.head_dim, dtype=dtype), None
 
-    def forward(self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor) -> torch.Tensor:
-        x = x + self.mixer(self.norm(x), inference_params, freqs_cis)
+    def forward(
+        self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor, attn_mask: torch.Tensor
+    ) -> torch.Tensor:
+        x = x + self.mixer(self.norm(x), inference_params, freqs_cis, attn_mask)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -122,7 +141,9 @@ class Attention(nn.Module):
         self.in_proj = nn.Linear(config.d_model, total_head_dim, bias=False)
         self.out_proj = nn.Linear(self.num_heads * self.head_dim, config.d_model, bias=False)
 
-    def forward(self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor, attn_mask: torch.Tensor
+    ) -> torch.Tensor:
         batch_size, seqlen, _ = x.shape
 
         q_size = self.num_heads * self.head_dim
@@ -141,8 +162,7 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
-        attn_mask = _build_attn_mask(batch_size, self.num_heads, q, k, is_causal=seqlen > 1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=True)
 
         y = y.transpose(1, 2).contiguous().view(batch_size, seqlen, q_size)
 
