@@ -36,12 +36,13 @@ def _update_kv_cache(
     """k/v: (batch_size, seqlen, nheads, head_dim) or (batch_size, 1, nheads, head_dim)"""
     kv_cache, _ = inference_params.key_value_memory_dict[layer_idx]
     # Adjust key and value for inference
-    start = inference_params.lengths_per_sample.long()  # [B]
-    seq_idx = start.unsqueeze(1) + torch.arange(k.shape[1], device=k.device).unsqueeze(0)  # [B, S]
-    batch_idx = torch.arange(len(start), device=k.device).unsqueeze(1)  # [B, 1]
+    start = inference_params.lengths_per_sample  # [B]
+    seq_idx = start.unsqueeze(1) + torch.arange(k.shape[1], device=k.device, dtype=torch.long).unsqueeze(0)  # [B, S]
+    batch_idx = torch.arange(kv_cache.size(0), device=k.device, dtype=torch.long).unsqueeze(1)  # [B, 1]
     kv_cache[batch_idx, seq_idx, 0, ...] = k
     kv_cache[batch_idx, seq_idx, 1, ...] = v
-    return kv_cache[:, : start.max() + k.shape[1], ...]
+    maxlen = inference_params.seqlen_offset + k.shape[1]
+    return kv_cache[:, :maxlen, ...]
 
 
 def _build_attn_mask(B, H, L, S, is_causal=True, lengths_per_sample=None, device="cuda"):
@@ -54,7 +55,7 @@ def _build_attn_mask(B, H, L, S, is_causal=True, lengths_per_sample=None, device
     attn_bias = attn_bias.unsqueeze(0).unsqueeze(0).expand(B, H, L, S)
 
     if lengths_per_sample is not None and L == 1:
-        arange = torch.arange(S, device=device)
+        arange = torch.arange(S, device=device, dtype=torch.long)
         # valid: [B, S], True where unmasked
         valid = arange <= lengths_per_sample.unsqueeze(1)
         # mask: [B, H, L, S], True where masked
@@ -94,7 +95,7 @@ class TorchZonosBackbone(nn.Module):
             hidden_states.shape[0],
             self.config.attn_cfg["num_heads"],
             hidden_states.shape[1],
-            inference_params.lengths_per_sample.max() + hidden_states.shape[1],
+            inference_params.seqlen_offset + hidden_states.shape[1],
             is_causal=hidden_states.shape[1] > 1,
             lengths_per_sample=inference_params.lengths_per_sample,
         )
