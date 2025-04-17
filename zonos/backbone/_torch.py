@@ -72,8 +72,20 @@ class TorchZonosBackbone(nn.Module):
         input_pos = torch.arange(0, S, device=hidden_states.device)
         input_pos = input_pos + inference_params.lengths_per_sample.unsqueeze(-1)
         freqs_cis = self.freqs_cis[input_pos].expand(hidden_states.shape[0], -1, -1, -1)
+
+        # Build cumulative sequence lengths for varlen API, enforce int32 dtype
+        cu_seqlens_q = torch.arange(0, B * S + 1, S, dtype=torch.int32, device=hidden_states.device)
+
+        if S > 1:
+            cu_seqlens_k = torch.arange(0, B * S + 1, S, dtype=torch.int32, device=hidden_states.device)
+        else:
+            # Single-token query: include current token in KV lengths for self-attention
+            kv_lens = inference_params.lengths_per_sample + S
+            zero = torch.tensor([0], dtype=torch.int32, device=hidden_states.device)
+            cu_seqlens_k = torch.cat([zero, torch.cumsum(kv_lens, dim=0)]).to(torch.int32)
+
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, inference_params, freqs_cis)
+            hidden_states = layer(hidden_states, inference_params, freqs_cis, cu_seqlens_q, cu_seqlens_k)
         return self.norm_f(hidden_states)
 
 
@@ -100,8 +112,10 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         inference_params: InferenceParams,
         freqs_cis: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
     ) -> torch.Tensor:
-        x = x + self.mixer(self.norm(x), inference_params, freqs_cis)
+        x = x + self.mixer(self.norm(x), inference_params, freqs_cis, cu_seqlens_q, cu_seqlens_k)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -118,7 +132,14 @@ class Attention(nn.Module):
         self.in_proj = nn.Linear(config.d_model, total_head_dim, bias=False)
         self.out_proj = nn.Linear(self.num_heads * self.head_dim, config.d_model, bias=False)
 
-    def forward(self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        inference_params: InferenceParams,
+        freqs_cis: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+    ) -> torch.Tensor:
         batch_size, seqlen, _ = x.shape
 
         q_size = self.num_heads * self.head_dim
@@ -141,31 +162,16 @@ class Attention(nn.Module):
         q_flat = q.contiguous().view(-1, self.num_heads, self.head_dim)
         k_flat = k.contiguous().view(-1, self.num_heads_kv, self.head_dim)
         v_flat = v.contiguous().view(-1, self.num_heads_kv, self.head_dim)
-        # Determine per-sample sequence lengths
-        if seqlen > 1:
-            q_lens = torch.full((batch_size,), seqlen, dtype=torch.int32, device=q.device)
-            kv_lens = torch.full((batch_size,), seqlen, dtype=torch.int32, device=k.device)
-            causal_flag = True
-        else:
-            # Single-token query: include current token in KV lengths for self-attention
-            q_lens = torch.ones((batch_size,), dtype=torch.int32, device=q.device)
-            kv_lens = (inference_params.lengths_per_sample + seqlen).to(torch.int32)
-            causal_flag = False
-        # Build cumulative sequence lengths for varlen API, enforce int32 dtype
-        cu_seqlens_q = torch.cat([torch.tensor([0], dtype=torch.int32, device=q.device), torch.cumsum(q_lens, dim=0)])
-        cu_seqlens_k = torch.cat([torch.tensor([0], dtype=torch.int32, device=k.device), torch.cumsum(kv_lens, dim=0)])
         # Call FlashAttention varlen function
         y_flat = flash_attn_varlen_func(
             q_flat,
             k_flat,
             v_flat,
-            cu_seqlens_q.to(torch.int32),
-            cu_seqlens_k.to(torch.int32),
+            cu_seqlens_q,
+            cu_seqlens_k,
             max_seqlen_q=seqlen,
             max_seqlen_k=inference_params.seqlen_offset + seqlen,
-            dropout_p=0.0,
-            softmax_scale=None,
-            causal=causal_flag,
+            causal=seqlen > 1,
         )
         # Reshape back to batched output
         y = y_flat.view(batch_size, seqlen, self.num_heads, self.head_dim)

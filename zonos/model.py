@@ -246,8 +246,12 @@ class Zonos(nn.Module):
 
         # Use CUDA Graphs if supported, and torch.compile otherwise.
         cg = self.can_use_cudagraphs()
-        decode_one_token = self._decode_one_token
-        decode_one_token = torch.compile(decode_one_token, dynamic=True, disable=cg or disable_torch_compile)
+        decode_one_token = torch.compile(
+            self._decode_one_token, dynamic=None, disable=cg or disable_torch_compile, mode="max-autotune-no-cudagraphs"
+        )
+        prefill = torch.compile(
+            self._prefill, dynamic=None, disable=cg or disable_torch_compile, mode="max-autotune-no-cudagraphs"
+        )
 
         audio_seq_len = prefix_audio_len + max_new_tokens
         seq_len = prefix_conditioning.shape[1] + audio_seq_len + 9
@@ -263,7 +267,7 @@ class Zonos(nn.Module):
 
         delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
 
-        logits = self._prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
+        logits = prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
         next_token = sample_from_logits(logits, **sampling_params)
 
         offset = delayed_prefix_audio_codes.shape[2]
