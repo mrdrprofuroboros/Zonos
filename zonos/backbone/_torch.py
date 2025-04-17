@@ -2,8 +2,13 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from zonos.config import BackboneConfig, InferenceParams
+
+
+def causal_mask(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
 
 
 def precompute_freqs_cis(seq_len: int, n_elem: int, base: float = 10000) -> torch.Tensor:
@@ -45,26 +50,6 @@ def _update_kv_cache(
     return kv_cache[:, :maxlen, ...]
 
 
-def _build_attn_mask(B, H, L, S, is_causal=True, lengths_per_sample=None, device="cuda"):
-    attn_bias = torch.zeros(L, S, dtype=torch.bfloat16, device=device)
-
-    if is_causal:
-        temp_mask = torch.ones(L, S, dtype=torch.bool, device=device).tril(diagonal=0)
-        attn_bias.masked_fill_(~temp_mask, float("-inf"))
-
-    attn_bias = attn_bias.unsqueeze(0).unsqueeze(0).expand(B, H, L, S)
-
-    if lengths_per_sample is not None and L == 1:
-        arange = torch.arange(S, device=device, dtype=torch.long)
-        # valid: [B, S], True where unmasked
-        valid = arange <= lengths_per_sample.unsqueeze(1)
-        # mask: [B, H, L, S], True where masked
-        mask = ~valid[:, None, None, :].expand(B, H, L, S)
-        attn_bias = attn_bias.masked_fill(mask, float("-inf"))
-
-    return attn_bias
-
-
 class TorchZonosBackbone(nn.Module):
     supported_architectures = ["transformer"]
     freqs_cis: torch.Tensor
@@ -87,20 +72,22 @@ class TorchZonosBackbone(nn.Module):
         }
 
     def forward(self, hidden_states: torch.Tensor, inference_params: InferenceParams) -> torch.Tensor:
-        input_pos = torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
+        B, S, _ = hidden_states.shape
+        input_pos = torch.arange(0, S, device=hidden_states.device)
         input_pos = input_pos + inference_params.lengths_per_sample.unsqueeze(-1)
-
         freqs_cis = self.freqs_cis[input_pos].expand(hidden_states.shape[0], -1, -1, -1)
-        attn_mask = _build_attn_mask(
-            hidden_states.shape[0],
-            self.config.attn_cfg["num_heads"],
-            hidden_states.shape[1],
-            inference_params.seqlen_offset + hidden_states.shape[1],
-            is_causal=hidden_states.shape[1] > 1,
-            lengths_per_sample=inference_params.lengths_per_sample,
-        )
+        lengths_per_sample = inference_params.lengths_per_sample
+
+        # TODO: wouldn't work with prefill batches because they need both causal and jagged simultaneously
+        def jagged_mask(b, h, q_idx, kv_idx):
+            return kv_idx <= lengths_per_sample[b]
+
+        mask_mod = causal_mask if S > 1 else jagged_mask
+        kv_len = inference_params.seqlen_offset + S
+        block_mask = create_block_mask(mask_mod, B=B, H=None, Q_LEN=S, KV_LEN=kv_len)
+
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, inference_params, freqs_cis, attn_mask)
+            hidden_states = layer(hidden_states, inference_params, freqs_cis, block_mask)
         return self.norm_f(hidden_states)
 
 
@@ -123,9 +110,13 @@ class TransformerBlock(nn.Module):
         return torch.zeros(batch_size, max_seqlen, 2, self.num_heads_kv, self.head_dim, dtype=dtype), None
 
     def forward(
-        self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor, attn_mask: torch.Tensor
+        self,
+        x: torch.Tensor,
+        inference_params: InferenceParams,
+        freqs_cis: torch.Tensor,
+        block_mask: BlockMask,
     ) -> torch.Tensor:
-        x = x + self.mixer(self.norm(x), inference_params, freqs_cis, attn_mask)
+        x = x + self.mixer(self.norm(x), inference_params, freqs_cis, block_mask)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -143,7 +134,7 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(self.num_heads * self.head_dim, config.d_model, bias=False)
 
     def forward(
-        self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor, attn_mask: torch.Tensor
+        self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor, block_mask: BlockMask
     ) -> torch.Tensor:
         batch_size, seqlen, _ = x.shape
 
@@ -163,7 +154,7 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=True)
+        y = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
 
         y = y.transpose(1, 2).contiguous().view(batch_size, seqlen, q_size)
 
