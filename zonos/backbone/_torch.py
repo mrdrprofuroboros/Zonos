@@ -1,14 +1,10 @@
 # Based on gpt-fast: https://github.com/pytorch-labs/gpt-fast/blob/095b2229ee3a40e379c11f05b94bd6923db63b4b/model.py
 import torch
 import torch.nn as nn
+from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.nn import functional as F
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from zonos.config import BackboneConfig, InferenceParams
-
-
-def causal_mask(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx
 
 
 def precompute_freqs_cis(seq_len: int, n_elem: int, base: float = 10000) -> torch.Tensor:
@@ -76,18 +72,8 @@ class TorchZonosBackbone(nn.Module):
         input_pos = torch.arange(0, S, device=hidden_states.device)
         input_pos = input_pos + inference_params.lengths_per_sample.unsqueeze(-1)
         freqs_cis = self.freqs_cis[input_pos].expand(hidden_states.shape[0], -1, -1, -1)
-        lengths_per_sample = inference_params.lengths_per_sample
-
-        # TODO: wouldn't work with prefill batches because they need both causal and jagged simultaneously
-        def jagged_mask(b, h, q_idx, kv_idx):
-            return kv_idx <= lengths_per_sample[b]
-
-        mask_mod = causal_mask if S > 1 else jagged_mask
-        kv_len = inference_params.seqlen_offset + S
-        block_mask = create_block_mask(mask_mod, B=B, H=None, Q_LEN=S, KV_LEN=kv_len)
-
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, inference_params, freqs_cis, block_mask)
+            hidden_states = layer(hidden_states, inference_params, freqs_cis)
         return self.norm_f(hidden_states)
 
 
@@ -114,9 +100,8 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         inference_params: InferenceParams,
         freqs_cis: torch.Tensor,
-        block_mask: BlockMask,
     ) -> torch.Tensor:
-        x = x + self.mixer(self.norm(x), inference_params, freqs_cis, block_mask)
+        x = x + self.mixer(self.norm(x), inference_params, freqs_cis)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -133,9 +118,7 @@ class Attention(nn.Module):
         self.in_proj = nn.Linear(config.d_model, total_head_dim, bias=False)
         self.out_proj = nn.Linear(self.num_heads * self.head_dim, config.d_model, bias=False)
 
-    def forward(
-        self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor, block_mask: BlockMask
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor) -> torch.Tensor:
         batch_size, seqlen, _ = x.shape
 
         q_size = self.num_heads * self.head_dim
@@ -152,11 +135,41 @@ class Attention(nn.Module):
         kv = _update_kv_cache(k, v, inference_params, self.layer_idx)
         k, v = kv.unbind(dim=-3)
 
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
-
-        y = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
-
-        y = y.transpose(1, 2).contiguous().view(batch_size, seqlen, q_size)
+        # Pack Q, K, V for FlashAttention varlen API
+        # q,k,v shapes: (batch_size, seqlen, num_heads or num_heads_kv, head_dim)
+        # Ensure contiguous memory before flattening, so view works without reshape
+        q_flat = q.contiguous().view(-1, self.num_heads, self.head_dim)
+        k_flat = k.contiguous().view(-1, self.num_heads_kv, self.head_dim)
+        v_flat = v.contiguous().view(-1, self.num_heads_kv, self.head_dim)
+        # Determine per-sample sequence lengths
+        if seqlen > 1:
+            q_lens = torch.full((batch_size,), seqlen, dtype=torch.int32, device=q.device)
+            kv_lens = torch.full((batch_size,), seqlen, dtype=torch.int32, device=k.device)
+            causal_flag = True
+        else:
+            # Single-token query: include current token in KV lengths for self-attention
+            q_lens = torch.ones((batch_size,), dtype=torch.int32, device=q.device)
+            kv_lens = (inference_params.lengths_per_sample + seqlen).to(torch.int32)
+            causal_flag = False
+        # Build cumulative sequence lengths for varlen API, enforce int32 dtype
+        cu_seqlens_q = torch.cat([torch.tensor([0], dtype=torch.int32, device=q.device), torch.cumsum(q_lens, dim=0)])
+        cu_seqlens_k = torch.cat([torch.tensor([0], dtype=torch.int32, device=k.device), torch.cumsum(kv_lens, dim=0)])
+        # Call FlashAttention varlen function
+        y_flat = flash_attn_varlen_func(
+            q_flat,
+            k_flat,
+            v_flat,
+            cu_seqlens_q.to(torch.int32),
+            cu_seqlens_k.to(torch.int32),
+            max_seqlen_q=seqlen,
+            max_seqlen_k=inference_params.seqlen_offset + seqlen,
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=causal_flag,
+        )
+        # Reshape back to batched output
+        y = y_flat.view(batch_size, seqlen, self.num_heads, self.head_dim)
+        y = y.reshape(batch_size, seqlen, q_size)  # merge heads and head_dim
 
         y = self.out_proj(y)
         return y
