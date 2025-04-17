@@ -110,7 +110,7 @@ class Zonos(nn.Module):
         return torch.stack([head(hidden_states) for head in self.heads], dim=1)
 
     def _compute_logits(
-        self, hidden_states: torch.Tensor, inference_params: InferenceParams, cfg_scale: float
+        self, hidden_states: torch.Tensor, inference_params: InferenceParams, cfg_scale: float | None = None
     ) -> torch.Tensor:
         """
         Pass `hidden_states` into `backbone` and `multi_head`, applying
@@ -118,7 +118,7 @@ class Zonos(nn.Module):
         """
         last_hidden_states = self.backbone(hidden_states, inference_params)[:, -1, :].unsqueeze(1)
         logits = self.apply_heads(last_hidden_states).squeeze(2).float()
-        if cfg_scale != 1.0:
+        if cfg_scale is not None:
             cond_logits = logits[::2]
             uncond_logits = logits[1::2]
             logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
@@ -129,7 +129,7 @@ class Zonos(nn.Module):
         self,
         input_ids: torch.Tensor,
         inference_params: InferenceParams,
-        cfg_scale: float,
+        cfg_scale: float | None = None,
         allow_cudagraphs: bool = True,
     ) -> torch.Tensor:
         """
@@ -140,10 +140,9 @@ class Zonos(nn.Module):
         doing 3 warmup steps if needed and then capturing or replaying the graph.
         We only recapture if the batch size changes.
         """
-        # TODO: support cfg_scale==1
-        if cfg_scale == 1.0:
+        if cfg_scale is None:
             hidden_states = self.embed_codes(input_ids)
-            return self._compute_logits(hidden_states, inference_params, cfg_scale)
+            return self._compute_logits(hidden_states, inference_params)
 
         bsz = input_ids.size(0)
 
@@ -190,30 +189,45 @@ class Zonos(nn.Module):
 
         return self._cg_logits
 
-    def _prefill(
+    def _causal_prefill(
         self,
         prefix_hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         inference_params: InferenceParams,
-        cfg_scale: float,
+        cfg_scale: float | None = None,
     ) -> torch.Tensor:
         """
         "Prefill" mode: we already have `prefix_hidden_states`, and we want
         to append new embeddings, then compute the logits.
         """
         # Replicate input_ids if CFG is enabled
-        if cfg_scale != 1.0:
+        if cfg_scale is not None:
             input_ids = input_ids.expand(prefix_hidden_states.shape[0], -1, -1)
         hidden_states = torch.cat([prefix_hidden_states, self.embed_codes(input_ids)], dim=1)
-        return self._compute_logits(hidden_states, inference_params, cfg_scale)
+        return self._compute_logits(hidden_states, inference_params)
 
-    def setup_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16) -> InferenceParams:
+    def setup_kv_cache(
+        self, kv_cache_batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16
+    ) -> InferenceParams:
         max_seqlen = find_multiple(max_seqlen, 8)
-        key_value_memory_dict = self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
-        lengths_per_sample = torch.full((batch_size,), 0, dtype=torch.int32)
-        return InferenceParams(max_seqlen, batch_size, 0, 0, key_value_memory_dict, lengths_per_sample)
+        key_value_memory_dict = self.backbone.allocate_inference_cache(kv_cache_batch_size, max_seqlen, dtype=dtype)
+        lengths_per_sample = torch.full((kv_cache_batch_size,), 0, dtype=torch.int32)
+        return InferenceParams(max_seqlen, kv_cache_batch_size, 0, 0, key_value_memory_dict, lengths_per_sample)
 
-    def prepare_conditioning(self, cond_dict: dict, uncond_dict: dict | None = None) -> torch.Tensor:
+    def _compile_params(self, options: dict) -> tuple[dict, bool]:
+        cg = self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
+        mode = "max-autotune" if cg else "max-autotune-no-cudagraphs"
+        return {
+            "dynamic": options.get("dynamic", True),
+            "disable": cg or options.get("disable", False),
+            "mode": options.get("mode", mode),
+        }, cg
+
+    def prepare_conditioning(
+        self, cond_dict: dict, uncond_dict: dict | None = None, cfg_scale: float | None = None
+    ) -> torch.Tensor:
+        if cfg_scale is None:
+            return self.prefix_conditioner(cond_dict)
         if uncond_dict is None:
             uncond_dict = {k: cond_dict[k] for k in self.prefix_conditioner.required_keys}
         return torch.cat(
@@ -223,41 +237,33 @@ class Zonos(nn.Module):
             ]
         )
 
-    def can_use_cudagraphs(self) -> bool:
-        # Only the mamba-ssm backbone supports CUDA Graphs at the moment
-        return self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
-
     @torch.inference_mode()
     def generate(
         self,
         prefix_conditioning: torch.Tensor,  # [bsz, cond_seq_len, d_model]
         audio_prefix_codes: torch.Tensor | None = None,  # [bsz, 9, prefix_audio_seq_len]
         max_new_tokens: int = 86 * 30,
-        cfg_scale: float = 2.0,
-        batch_size: int = 1,
+        cfg_scale: float | None = None,
         sampling_params: dict = dict(min_p=0.1),
+        compile_params: dict = dict(),
         progress_bar: bool = True,
-        disable_torch_compile: bool = False,
         callback: Callable[[torch.Tensor, int, int], bool] | None = None,
     ):
-        assert cfg_scale != 1, "TODO: add support for cfg_scale=1"
+        batch_size = prefix_conditioning.size(0)
+        kv_cache_batch_size = batch_size * (2 if cfg_scale is not None else 1)
         prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
         device = self.device
 
         # Use CUDA Graphs if supported, and torch.compile otherwise.
-        cg = self.can_use_cudagraphs()
-        decode_one_token = torch.compile(
-            self._decode_one_token, dynamic=None, disable=cg or disable_torch_compile, mode="max-autotune-no-cudagraphs"
-        )
-        prefill = torch.compile(
-            self._prefill, dynamic=None, disable=cg or disable_torch_compile, mode="max-autotune-no-cudagraphs"
-        )
+        compile_params, allow_cg = self._compile_params(compile_params)
+        decode_one_token = torch.compile(self._decode_one_token, **compile_params)
+        causal_prefill = torch.compile(self._causal_prefill, **compile_params)
 
         audio_seq_len = prefix_audio_len + max_new_tokens
         seq_len = prefix_conditioning.shape[1] + audio_seq_len + 9
 
         with torch.device(device):
-            inference_params = self.setup_cache(batch_size=batch_size * 2, max_seqlen=seq_len)
+            inference_params = self.setup_kv_cache(kv_cache_batch_size=kv_cache_batch_size, max_seqlen=seq_len)
             codes = torch.full((batch_size, 9, audio_seq_len), UNKNOWN_TOKEN)
 
         if audio_prefix_codes is not None:
@@ -267,7 +273,7 @@ class Zonos(nn.Module):
 
         delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
 
-        logits = prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
+        logits = causal_prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params)
         next_token = sample_from_logits(logits, **sampling_params)
 
         offset = delayed_prefix_audio_codes.shape[2]
@@ -295,7 +301,7 @@ class Zonos(nn.Module):
         while torch.max(remaining_steps) > 0:
             offset += 1
             input_ids = delayed_codes[..., offset - 1 : offset]
-            logits = decode_one_token(input_ids, inference_params, cfg_scale, allow_cudagraphs=cg)
+            logits = decode_one_token(input_ids, inference_params, allow_cudagraphs=allow_cg)
             logits += logit_bias
 
             next_token = sample_from_logits(logits, generated_tokens=delayed_codes[..., :offset], **sampling_params)
@@ -403,7 +409,7 @@ class Zonos(nn.Module):
             seq_len = prefix_conditioning.shape[1] + audio_seq_len + 9
 
             with torch.device(device):
-                inference_params = self.setup_cache(batch_size=batch_size * 2, max_seqlen=seq_len)
+                inference_params = self.setup_kv_cache(kv_cache_batch_size=batch_size * 2, max_seqlen=seq_len)
                 codes = torch.full((batch_size, 9, audio_seq_len), UNKNOWN_TOKEN)
 
             if audio_prefix_codes is not None:
@@ -412,7 +418,7 @@ class Zonos(nn.Module):
             delayed_codes = apply_delay_pattern(codes, self.masked_token_id)
             delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
 
-            logits = self._prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
+            logits = self._causal_prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
             next_token = sample_from_logits(logits, **sampling_params)
 
             offset = delayed_prefix_audio_codes.shape[2]
