@@ -70,7 +70,7 @@ class TorchZonosBackbone(nn.Module):
         B, S, _ = hidden_states.shape
         input_pos = torch.arange(S, device=hidden_states.device)
         input_pos = input_pos + inference_params.lengths_per_sample.unsqueeze(-1)
-        freqs_cis = self.freqs_cis[input_pos].expand(hidden_states.shape[0], -1, -1, -1)
+        freqs_cis = self.freqs_cis[input_pos]
 
         # Build cumulative sequence lengths for varlen API, enforce int32 dtype
         cu_seqlens_q = torch.arange(0, B * S + 1, S, dtype=torch.int32, device=hidden_states.device)
@@ -83,7 +83,7 @@ class TorchZonosBackbone(nn.Module):
             zero = torch.tensor([0], dtype=torch.int32, device=hidden_states.device)
             cu_seqlens_k = torch.cat([zero, torch.cumsum(kv_lens, dim=0)]).to(torch.int32)
 
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             hidden_states = layer(hidden_states, inference_params, freqs_cis, cu_seqlens_q, cu_seqlens_k)
         return self.norm_f(hidden_states)
 
@@ -104,7 +104,7 @@ class TransformerBlock(nn.Module):
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16):
         # setting it to zeros rather than empty to avoid nan explosions in scaled_dot_product_attention
         # in the masked out regions
-        # Shape: (B, T, 2, heads_kv, head_dim) for explicit k/v packing
+        # Shape: (B, S, 2, heads_kv, head_dim) for explicit k/v packing
         return torch.zeros(batch_size, max_seqlen, 2, self.num_heads_kv, self.head_dim, dtype=dtype), None
 
     def forward(

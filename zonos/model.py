@@ -142,7 +142,7 @@ class Zonos(nn.Module):
         """
         if cfg_scale is None:
             hidden_states = self.embed_codes(input_ids)
-            return self._compute_logits(hidden_states, inference_params)
+            return self._compute_logits(hidden_states, inference_params, cfg_scale)
 
         bsz = input_ids.size(0)
 
@@ -204,7 +204,7 @@ class Zonos(nn.Module):
         if cfg_scale is not None:
             input_ids = input_ids.expand(prefix_hidden_states.shape[0], -1, -1)
         hidden_states = torch.cat([prefix_hidden_states, self.embed_codes(input_ids)], dim=1)
-        return self._compute_logits(hidden_states, inference_params)
+        return self._compute_logits(hidden_states, inference_params, cfg_scale)
 
     def setup_kv_cache(
         self, kv_cache_batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16
@@ -240,7 +240,7 @@ class Zonos(nn.Module):
     @torch.inference_mode()
     def generate(
         self,
-        prefix_conditioning: torch.Tensor,  # [bsz, cond_seq_len, d_model]
+        cond_dicts: list[dict],
         audio_prefix_codes: torch.Tensor | None = None,  # [bsz, 9, prefix_audio_seq_len]
         max_new_tokens: int = 86 * 30,
         cfg_scale: float | None = None,
@@ -249,8 +249,11 @@ class Zonos(nn.Module):
         progress_bar: bool = True,
         callback: Callable[[torch.Tensor, int, int], bool] | None = None,
     ):
-        batch_size = prefix_conditioning.size(0)
-        kv_cache_batch_size = batch_size * (2 if cfg_scale is not None else 1)
+        batch_size = len(cond_dicts)
+        prefix_conditioning = torch.cat(
+            [self.prepare_conditioning(make_cond_dict(**cd), cfg_scale=cfg_scale) for cd in cond_dicts], dim=0
+        )
+        kv_cache_batch_size = prefix_conditioning.size(0)
         prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
         device = self.device
 
@@ -270,10 +273,9 @@ class Zonos(nn.Module):
             codes[..., :prefix_audio_len] = audio_prefix_codes
 
         delayed_codes = apply_delay_pattern(codes, self.masked_token_id)
-
         delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
 
-        logits = causal_prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params)
+        logits = causal_prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
         next_token = sample_from_logits(logits, **sampling_params)
 
         offset = delayed_prefix_audio_codes.shape[2]
@@ -301,7 +303,7 @@ class Zonos(nn.Module):
         while torch.max(remaining_steps) > 0:
             offset += 1
             input_ids = delayed_codes[..., offset - 1 : offset]
-            logits = decode_one_token(input_ids, inference_params, allow_cudagraphs=allow_cg)
+            logits = decode_one_token(input_ids, inference_params, cfg_scale, allow_cudagraphs=allow_cg)
             logits += logit_bias
 
             next_token = sample_from_logits(logits, generated_tokens=delayed_codes[..., :offset], **sampling_params)
