@@ -1,7 +1,7 @@
 # Based on gpt-fast: https://github.com/pytorch-labs/gpt-fast/blob/095b2229ee3a40e379c11f05b94bd6923db63b4b/model.py
 import torch
 import torch.nn as nn
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
+from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func
 from torch.nn import functional as F
 
 from zonos.config import BackboneConfig, InferenceParams
@@ -40,10 +40,9 @@ def _update_kv_cache(
     start = inference_params.lengths_per_sample  # [B]
     seq_idx = start.unsqueeze(1) + torch.arange(k.shape[1], device=k.device, dtype=torch.long).unsqueeze(0)  # [B, S]
     batch_idx = torch.arange(kv_cache.size(0), device=k.device, dtype=torch.long).unsqueeze(1)  # [B, 1]
-    kv_cache[batch_idx, seq_idx, 0, ...] = k
-    kv_cache[batch_idx, seq_idx, 1, ...] = v
-    maxlen = inference_params.seqlen_offset + k.shape[1]
-    return kv_cache[:, :maxlen, ...]
+    # Store k and v as separate heads in dimension 2: shape becomes (B, S, 2, heads_kv, head_dim)
+    kv_cache[batch_idx, seq_idx] = torch.stack([k, v], dim=2)
+    return kv_cache
 
 
 class TorchZonosBackbone(nn.Module):
@@ -69,7 +68,7 @@ class TorchZonosBackbone(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, inference_params: InferenceParams) -> torch.Tensor:
         B, S, _ = hidden_states.shape
-        input_pos = torch.arange(0, S, device=hidden_states.device)
+        input_pos = torch.arange(S, device=hidden_states.device)
         input_pos = input_pos + inference_params.lengths_per_sample.unsqueeze(-1)
         freqs_cis = self.freqs_cis[input_pos].expand(hidden_states.shape[0], -1, -1, -1)
 
@@ -105,6 +104,7 @@ class TransformerBlock(nn.Module):
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16):
         # setting it to zeros rather than empty to avoid nan explosions in scaled_dot_product_attention
         # in the masked out regions
+        # Shape: (B, T, 2, heads_kv, head_dim) for explicit k/v packing
         return torch.zeros(batch_size, max_seqlen, 2, self.num_heads_kv, self.head_dim, dtype=dtype), None
 
     def forward(
@@ -154,23 +154,14 @@ class Attention(nn.Module):
         k = apply_rotary_emb(k, freqs_cis)
 
         kv = _update_kv_cache(k, v, inference_params, self.layer_idx)
-        k, v = kv.unbind(dim=-3)
-
-        # Pack Q, K, V for FlashAttention varlen API
-        # q,k,v shapes: (batch_size, seqlen, num_heads or num_heads_kv, head_dim)
-        # Ensure contiguous memory before flattening, so view works without reshape
-        q_flat = q.contiguous().view(-1, self.num_heads, self.head_dim)
-        k_flat = k.contiguous().view(-1, self.num_heads_kv, self.head_dim)
-        v_flat = v.contiguous().view(-1, self.num_heads_kv, self.head_dim)
-        # Call FlashAttention varlen function
-        y_flat = flash_attn_varlen_func(
-            q_flat,
-            k_flat,
-            v_flat,
+        # Pack Q and KV for FlashAttention varlen_kvpacked API (expects (total_k,2,heads_kv,head_dim))
+        y_flat = flash_attn_varlen_kvpacked_func(
+            q.view(-1, self.num_heads, self.head_dim),
+            kv.view(-1, 2, self.num_heads_kv, self.head_dim),
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q=seqlen,
-            max_seqlen_k=inference_params.seqlen_offset + seqlen,
+            max_seqlen_k=inference_params.max_seqlen,
             causal=seqlen > 1,
         )
         # Reshape back to batched output
