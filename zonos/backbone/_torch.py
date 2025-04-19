@@ -3,7 +3,7 @@ import math
 
 import torch
 import torch.nn as nn
-from flash_attn.flash_attn_interface import flash_attn_with_kvcache
+from flash_attn_interface import flash_attn_with_kvcache
 from torch.nn import functional as F
 
 from zonos.config import BackboneConfig, InferenceParams
