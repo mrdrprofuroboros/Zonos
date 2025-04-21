@@ -1,6 +1,9 @@
 # Based on gpt-fast: https://github.com/pytorch-labs/gpt-fast/blob/095b2229ee3a40e379c11f05b94bd6923db63b4b/model.py
+import math
+
 import torch
 import torch.nn as nn
+from flash_attn_interface import flash_attn_with_kvcache
 from torch.nn import functional as F
 
 from zonos.config import BackboneConfig, InferenceParams
@@ -30,25 +33,6 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return x_out2.type_as(x)
 
 
-def _update_kv_cache(
-    k: torch.Tensor, v: torch.Tensor, inference_params: InferenceParams, layer_idx: int
-) -> torch.Tensor:
-    """k/v: (batch_size, seqlen, nheads, head_dim) or (batch_size, 1, nheads, head_dim)"""
-    assert layer_idx in inference_params.key_value_memory_dict
-    kv_cache, _ = inference_params.key_value_memory_dict[layer_idx]
-    # Adjust key and value for inference
-    batch_start = inference_params.batch_size_offset
-    batch_end = batch_start + k.shape[0]
-    sequence_start = inference_params.seqlen_offset
-    sequence_end = sequence_start + k.shape[1]
-    assert batch_end <= kv_cache.shape[0]
-    assert sequence_end <= kv_cache.shape[1]
-    assert kv_cache is not None
-    kv_cache[batch_start:batch_end, sequence_start:sequence_end, 0, ...] = k
-    kv_cache[batch_start:batch_end, sequence_start:sequence_end, 1, ...] = v
-    return kv_cache[batch_start:batch_end, :sequence_end, ...]
-
-
 class TorchZonosBackbone(nn.Module):
     supported_architectures = ["transformer"]
     freqs_cis: torch.Tensor
@@ -62,21 +46,22 @@ class TorchZonosBackbone(nn.Module):
         self.norm_f = nn.LayerNorm(config.d_model, eps=config.norm_epsilon)
 
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16):
-        # TODO: This function should be pure
-        head_dim = self.config.d_model // self.config.attn_cfg["num_heads"]
-        self.freqs_cis = precompute_freqs_cis(16384, head_dim)
+        self.freqs_cis = precompute_freqs_cis(16384, self.config.d_model // self.config.attn_cfg["num_heads"])
         return {
             i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
             for i, layer in enumerate(self.layers)
         }
 
     def forward(self, hidden_states: torch.Tensor, inference_params: InferenceParams) -> torch.Tensor:
-        input_pos = torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
+        input_pos = torch.arange(hidden_states.shape[1], device=hidden_states.device)
         input_pos = input_pos + inference_params.lengths_per_sample.unsqueeze(-1)
+        freqs_cis = self.freqs_cis[input_pos]
 
-        freqs_cis = self.freqs_cis[input_pos].expand(hidden_states.shape[0], -1, -1, -1)
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, inference_params, freqs_cis)
+            # Extract cache for this specific layer
+            layer_cache = inference_params.key_value_memory_dict[i]
+            # Pass the extracted cache directly to the layer
+            hidden_states = layer(hidden_states, inference_params, freqs_cis, layer_cache)
         return self.norm_f(hidden_states)
 
 
@@ -94,10 +79,30 @@ class TransformerBlock(nn.Module):
         self.head_dim = config.d_model // config.attn_cfg["num_heads"]
 
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16):
-        return torch.empty(batch_size, max_seqlen, 2, self.num_heads_kv, self.head_dim, dtype=dtype), None
+        # Use paged KV cache
+        paged_size = self.config.attn_cfg.get("paged_kv_block_size", 256)
 
-    def forward(self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor) -> torch.Tensor:
-        x = x + self.mixer(self.norm(x), inference_params, freqs_cis)
+        # Calculate number of pages needed
+        pages_per_seq = math.ceil(max_seqlen / paged_size)
+        total_pages = batch_size * pages_per_seq
+
+        # Create device-resident tensors for the cache
+        device = next(self.parameters()).device
+        k_cache = torch.zeros(total_pages, paged_size, self.num_heads_kv, self.head_dim, dtype=dtype, device=device)
+        v_cache = torch.zeros_like(k_cache)
+
+        # Create block_table mapping (batch_idx, logical_block_idx) → physical_block_idx
+        block_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(batch_size, pages_per_seq)
+        return (k_cache, v_cache, block_table)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        inference_params: InferenceParams,
+        freqs_cis: torch.Tensor,
+        layer_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        x = x + self.mixer(self.norm(x), inference_params, freqs_cis, layer_cache)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -114,7 +119,13 @@ class Attention(nn.Module):
         self.in_proj = nn.Linear(config.d_model, total_head_dim, bias=False)
         self.out_proj = nn.Linear(self.num_heads * self.head_dim, config.d_model, bias=False)
 
-    def forward(self, x: torch.Tensor, inference_params: InferenceParams, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        inference_params: InferenceParams,
+        freqs_cis: torch.Tensor,
+        layer_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
         batch_size, seqlen, _ = x.shape
 
         q_size = self.num_heads * self.head_dim
@@ -127,16 +138,24 @@ class Attention(nn.Module):
 
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
+        # Unpack cache components directly from the passed tuple
+        k_cache, v_cache, block_table = layer_cache
 
-        kv = _update_kv_cache(k, v, inference_params, self.layer_idx)
-        k, v = kv.unbind(dim=-3)
+        # Use flash_attn_with_kvcache for both prefill and decode
+        # It updates cache in-place and performs attention in one kernel
+        y = flash_attn_with_kvcache(
+            q=q,  # [B, S, H, D]
+            k_cache=k_cache,  # [num_blocks, block_size, H_kv, D]
+            v_cache=v_cache,  # [num_blocks, block_size, H_kv, D]
+            k=k,  # [B, S, H_kv, D] - keys to add
+            v=v,  # [B, S, H_kv, D] - values to add
+            cache_seqlens=inference_params.lengths_per_sample,  # [B]
+            block_table=block_table,  # [B, num_blocks_per_seq]
+            causal=seqlen > 1,  # Use causal mask for prefill (multi-token)
+        )
 
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
-
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=seqlen > 1, enable_gqa=True)
-
-        y = y.transpose(1, 2).contiguous().view(batch_size, seqlen, q_size)
-
+        # Reshape and project output
+        y = y.reshape(batch_size, seqlen, q_size)
         y = self.out_proj(y)
         return y
 
